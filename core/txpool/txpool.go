@@ -75,6 +75,8 @@ type TxPool struct {
 	term chan struct{}           // Termination channel to detect a closed pool
 
 	sync chan chan error // Testing / simulator channel to block until internal reset is done
+
+	txHandler *TxHandler // Handler for processing new transactions asynchronously
 }
 
 // New creates a new transaction pool to gather, sort and filter inbound
@@ -96,13 +98,14 @@ func New(gasTip uint64, chain BlockChain, subpools []SubPool) (*TxPool, error) {
 		return nil, err
 	}
 	pool := &TxPool{
-		subpools: subpools,
-		chain:    chain,
-		signer:   types.LatestSigner(chain.Config()),
-		state:    statedb,
-		quit:     make(chan chan error),
-		term:     make(chan struct{}),
-		sync:     make(chan chan error),
+		subpools:  subpools,
+		chain:     chain,
+		signer:    types.LatestSigner(chain.Config()),
+		state:     statedb,
+		quit:      make(chan chan error),
+		term:      make(chan struct{}),
+		sync:      make(chan chan error),
+		txHandler: NewTxHandler(),
 	}
 	reserver := NewReservationTracker()
 	for i, subpool := range subpools {
@@ -113,6 +116,7 @@ func New(gasTip uint64, chain BlockChain, subpools []SubPool) (*TxPool, error) {
 			return nil, err
 		}
 	}
+	pool.txHandler.Start()
 	go pool.loop(head)
 	return pool, nil
 }
@@ -120,6 +124,9 @@ func New(gasTip uint64, chain BlockChain, subpools []SubPool) (*TxPool, error) {
 // Close terminates the transaction pool and all its subpools.
 func (p *TxPool) Close() error {
 	var errs []error
+
+	// Terminate the transaction handler
+	p.txHandler.Stop()
 
 	// Terminate the reset loop and wait for it to finish
 	errc := make(chan error)
@@ -341,6 +348,22 @@ func (p *TxPool) Add(txs []*types.Transaction, sync bool) []error {
 	errsets := make([][]error, len(p.subpools))
 	for i := 0; i < len(p.subpools); i++ {
 		errsets[i] = p.subpools[i].Add(txsets[i], sync)
+	}
+
+	// Handle successfully added transactions asynchronously
+	for i, tx := range txs {
+		if splits[i] != -1 {
+			txIndex := 0
+			for j := 0; j < splits[i]; j++ {
+				txIndex += len(txsets[j])
+			}
+			for k, subTx := range txsets[splits[i]] {
+				if subTx == tx && errsets[splits[i]][k] == nil {
+					go p.txHandler.HandleNewTx(tx)
+					break
+				}
+			}
+		}
 	}
 	errs := make([]error, len(txs))
 	for i, split := range splits {
